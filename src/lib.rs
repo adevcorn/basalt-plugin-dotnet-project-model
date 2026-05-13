@@ -12,7 +12,7 @@ basalt_plugin_meta! {
     provides:     "project-model:dotnet",
     requires:     "",
     file_globs:   "",
-    activates_on: "*.sln\n*.csproj\n*.fsproj\n*.vbproj\n**/*.sln\n**/*.csproj\n**/*.fsproj\n**/*.vbproj",
+    activates_on: "*.sln\n*.slnx\n*.csproj\n*.fsproj\n*.vbproj\n**/*.sln\n**/*.slnx\n**/*.csproj\n**/*.fsproj\n**/*.vbproj",
     activation_events: "",
 }
 
@@ -377,6 +377,10 @@ fn owner_json(path: &str, match_kind: &str, label: &str, project_id: &str, kind:
 }
 
 fn parse_solution_projects(contents: &str) -> Vec<(String, String)> {
+    if contents.contains("<Solution") {
+        return parse_slnx_projects(contents);
+    }
+
     let mut out = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -393,6 +397,36 @@ fn parse_solution_projects(contents: &str) -> Vec<(String, String)> {
         out.push((name.to_string(), path.to_string()));
     }
     out
+}
+
+fn parse_slnx_projects(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if !line.starts_with("<Project ") {
+            continue;
+        }
+        let Some(path) = parse_attr(line, "Path") else { continue };
+        let normalized = normalize_rel_path(&path);
+        if !is_project_path(&normalized) {
+            continue;
+        }
+        let name = file_stem(&normalized).to_string();
+        out.push((name, normalized));
+    }
+    out
+}
+
+fn parse_attr(line: &str, attr: &str) -> Option<String> {
+    let needle = format!(r#"{attr}=""#);
+    let start = line.find(&needle)? + needle.len();
+    let end = line[start..].find('"')? + start;
+    let value = line[start..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn parse_bool_tag(contents: &str, tag: &str) -> bool {
@@ -432,7 +466,7 @@ fn read_host_file(path: &str) -> Option<String> {
 }
 
 fn is_solution_path(path: &str) -> bool {
-    path.ends_with(".sln")
+    path.ends_with(".sln") || path.ends_with(".slnx")
 }
 
 fn is_project_path(path: &str) -> bool {
