@@ -18,11 +18,14 @@ basalt_plugin_meta! {
 
 extern "C" {
     fn basalt_read_file(path_ptr: i32, path_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+    fn basalt_list_files(root_ptr: i32, root_len: i32, out_ptr: i32, out_cap: i32) -> i32;
 }
 
 const FILE_BUF_SIZE: usize = 4 * 1024 * 1024;
+const LIST_BUF_SIZE: usize = 8 * 1024 * 1024;
 
 static mut FILE_BUF: [u8; FILE_BUF_SIZE] = [0u8; FILE_BUF_SIZE];
+static mut LIST_BUF: [u8; LIST_BUF_SIZE] = [0u8; LIST_BUF_SIZE];
 
 #[derive(Clone)]
 struct ProjectInfo {
@@ -50,7 +53,35 @@ fn build_project_model(root: &str) -> Vec<u8> {
     if is_project_path(root) {
         return build_project_file_model(root).into_bytes();
     }
-    Vec::new()
+    // Core passes the workspace root directory: discover the manifest.
+    // Prefer a solution, fall back to the first project file found.
+    let Some(manifest) = discover_manifest(root) else {
+        return Vec::new();
+    };
+    if is_solution_path(&manifest) {
+        build_solution_model(&manifest).into_bytes()
+    } else {
+        build_project_file_model(&manifest).into_bytes()
+    }
+}
+
+/// Find the best build manifest under a workspace root directory.
+/// Returns the host path (root joined with the relative entry).
+fn discover_manifest(root: &str) -> Option<String> {
+    let mut best_sln: Option<String> = None;
+    let mut best_proj: Option<String> = None;
+    for rel in list_host_files(root) {
+        let norm = normalize_rel_path(&rel);
+        if best_sln.is_none() && is_solution_path(&norm) {
+            best_sln = Some(join_path(root, &norm));
+        } else if best_proj.is_none() && is_project_path(&norm) {
+            best_proj = Some(join_path(root, &norm));
+        }
+        if best_sln.is_some() && best_proj.is_some() {
+            break;
+        }
+    }
+    best_sln.or(best_proj)
 }
 
 fn build_solution_model(solution_path: &str) -> String {
@@ -463,6 +494,26 @@ fn read_host_file(path: &str) -> Option<String> {
     }
     let bytes = &buf[..n as usize];
     Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn list_host_files(root: &str) -> Vec<String> {
+    let buf: &mut [u8; LIST_BUF_SIZE] = unsafe { &mut *core::ptr::addr_of_mut!(LIST_BUF) };
+    let n = unsafe {
+        basalt_list_files(
+            root.as_ptr() as i32,
+            root.len() as i32,
+            buf.as_mut_ptr() as i32,
+            LIST_BUF_SIZE as i32,
+        )
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf[..n as usize]);
+    text.lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 fn is_solution_path(path: &str) -> bool {
