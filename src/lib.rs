@@ -8,7 +8,7 @@ use basalt_plugin_sdk::prelude::*;
 basalt_plugin_meta! {
     name:         "dotnet-project-model",
     version:      "0.1.0",
-    hook_flags:   CAP_PROJECT_MODEL,
+    hook_flags:   CAP_PROJECT_MODEL | CAP_REVIEW_ACTIONS | CAP_BUILD_SYSTEM | CAP_TEST_RUNNER,
     provides:     "project-model:dotnet",
     requires:     "",
     file_globs:   "",
@@ -16,9 +16,22 @@ basalt_plugin_meta! {
     activation_events: "",
 }
 
+#[cfg(target_arch = "wasm32")]
 extern "C" {
     fn basalt_read_file(path_ptr: i32, path_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     fn basalt_list_files(root_ptr: i32, root_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+unsafe extern "C" fn basalt_read_file(_path_ptr: i32, _path_len: i32, _out_ptr: i32, _out_cap: i32) -> i32 {
+    -1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+unsafe extern "C" fn basalt_list_files(_root_ptr: i32, _root_len: i32, _out_ptr: i32, _out_cap: i32) -> i32 {
+    -1
 }
 
 const FILE_BUF_SIZE: usize = 4 * 1024 * 1024;
@@ -633,4 +646,154 @@ fn escape_json(input: &str) -> String {
         }
     }
     out
+}
+
+// ── Review Actions & Build/Test Providers ────────────────────────────────────
+
+#[basalt_plugin]
+fn review_actions(_workspace_root: &str, _session_workspace: &str) -> Vec<ReviewActionDescriptor> {
+    vec![
+        ReviewActionDescriptor {
+            id: "dotnet-build".into(),
+            title: "Build .NET Solution / Project".into(),
+            kind: ReviewActionKind::Build,
+            ecosystem: "dotnet".into(),
+            command_preview: "dotnet build".into(),
+            mutates_workspace: false,
+            priority: 100,
+        },
+        ReviewActionDescriptor {
+            id: "dotnet-test".into(),
+            title: "Run .NET Tests".into(),
+            kind: ReviewActionKind::Test,
+            ecosystem: "dotnet".into(),
+            command_preview: "dotnet test".into(),
+            mutates_workspace: false,
+            priority: 100,
+        },
+    ]
+}
+
+#[basalt_plugin]
+fn review_action_plan(
+    action_id: &str,
+    _workspace_root: &str,
+    _session_workspace: &str,
+) -> Option<ReviewActionExecutionPlan> {
+    match action_id {
+        "dotnet-build" => Some(ReviewActionExecutionPlan {
+            executable: "dotnet".into(),
+            args: vec!["build".into(), "--nologo".into(), "-clp:NoSummary".into()],
+            env: Vec::new(),
+            cwd_mode: ReviewActionCwdMode::SessionWorkspace,
+            output_category: "build".into(),
+        }),
+        "dotnet-test" => Some(ReviewActionExecutionPlan {
+            executable: "dotnet".into(),
+            args: vec!["test".into(), "--nologo".into()],
+            env: Vec::new(),
+            cwd_mode: ReviewActionCwdMode::SessionWorkspace,
+            output_category: "test".into(),
+        }),
+        _ => None,
+    }
+}
+
+#[basalt_plugin]
+fn review_action_parse_line(
+    action_id: &str,
+    line: &[u8],
+    state: &[u8],
+) -> (Vec<u8>, Vec<AgentEvent>) {
+    let Ok(line_str) = core::str::from_utf8(line) else {
+        return (state.to_vec(), Vec::new());
+    };
+    let trimmed = line_str.trim();
+    if trimmed.is_empty() {
+        return (state.to_vec(), Vec::new());
+    }
+
+    let mut events = Vec::new();
+
+    if action_id == "dotnet-build" {
+        // MSBuild diagnostic line format:
+        // C:\Path\File.cs(12,34): error CS1002: ; expected [C:\Path\Project.csproj]
+        if trimmed.contains(": error ") || trimmed.contains(": warning ") {
+            events.push(AgentEvent::NewEntry {
+                vendor_id: format!("msbuild-{}", trimmed.len()),
+                tool: "dotnet-build".into(),
+                category: "build".into(),
+                raw_cmd: trimmed.to_string(),
+                file_paths: Vec::new(),
+            });
+        }
+    } else if action_id == "dotnet-test" {
+        // Dotnet test summary lines
+        if trimmed.starts_with("Failed ") {
+            events.push(AgentEvent::CloseEntry {
+                vendor_id: format!("test-{}", trimmed.len()),
+                exit_code: 1,
+                output_lines: vec![trimmed.to_string()],
+            });
+        } else if trimmed.starts_with("Passed ") {
+            events.push(AgentEvent::CloseEntry {
+                vendor_id: format!("test-{}", trimmed.len()),
+                exit_code: 0,
+                output_lines: vec![trimmed.to_string()],
+            });
+        }
+    }
+
+    (state.to_vec(), events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dotnet_review_actions_descriptors() {
+        let actions = review_actions("/tmp/ws", "/tmp/ws/.shadow");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].id, "dotnet-build");
+        assert_eq!(actions[0].kind, ReviewActionKind::Build);
+        assert_eq!(actions[1].id, "dotnet-test");
+        assert_eq!(actions[1].kind, ReviewActionKind::Test);
+    }
+
+    #[test]
+    fn test_dotnet_review_action_plan() {
+        let plan_build = review_action_plan("dotnet-build", "/tmp", "/tmp").unwrap();
+        assert_eq!(plan_build.executable, "dotnet");
+        assert_eq!(plan_build.args[0], "build");
+
+        let plan_test = review_action_plan("dotnet-test", "/tmp", "/tmp").unwrap();
+        assert_eq!(plan_test.executable, "dotnet");
+        assert_eq!(plan_test.args[0], "test");
+    }
+
+    #[test]
+    fn test_dotnet_review_action_parse_line() {
+        let line = b"C:\\test\\File.cs(10,5): error CS0103: The name 'foo' does not exist in the current context";
+        let (_, events) = review_action_parse_line("dotnet-build", line, &[]);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::NewEntry { raw_cmd, category, .. } => {
+                assert_eq!(category, "build");
+                assert!(raw_cmd.contains("error CS0103"));
+            }
+            _ => panic!("expected NewEntry with error"),
+        }
+
+        let test_line = b"Failed MyTestNamespace.UnitTest1.TestMethod [15 ms]";
+        let (_, test_events) = review_action_parse_line("dotnet-test", test_line, &[]);
+        assert_eq!(test_events.len(), 1);
+        match &test_events[0] {
+            AgentEvent::CloseEntry { exit_code, output_lines, .. } => {
+                assert_eq!(*exit_code, 1);
+                assert!(output_lines[0].contains("Failed MyTestNamespace"));
+            }
+            _ => panic!("expected CloseEntry with test failure"),
+        }
+    }
 }
