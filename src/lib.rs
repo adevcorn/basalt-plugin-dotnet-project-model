@@ -7,8 +7,8 @@ use basalt_plugin_sdk::prelude::*;
 
 basalt_plugin_meta! {
     name:         "dotnet-project-model",
-    version:      "0.1.0",
-    hook_flags:   CAP_PROJECT_MODEL | CAP_REVIEW_ACTIONS | CAP_BUILD_SYSTEM | CAP_TEST_RUNNER,
+    version:      "0.1.1",
+    hook_flags:   CAP_PROJECT_MODEL | CAP_REVIEW_ACTIONS | CAP_BUILD_SYSTEM | CAP_TEST_RUNNER | CAP_SHADOW_EXCLUDES,
     provides:     "project-model:dotnet",
     requires:     "",
     file_globs:   "",
@@ -39,6 +39,42 @@ const LIST_BUF_SIZE: usize = 8 * 1024 * 1024;
 
 static mut FILE_BUF: [u8; FILE_BUF_SIZE] = [0u8; FILE_BUF_SIZE];
 static mut LIST_BUF: [u8; LIST_BUF_SIZE] = [0u8; LIST_BUF_SIZE];
+
+/// `bin/` is output in .NET but source in Rust (`src/bin/`). Only claim the
+/// .NET interpretation when the workspace actually contains MSBuild markers.
+fn root_has_dotnet_project(root: &str) -> bool {
+    let n = unsafe {
+        basalt_list_files(
+            root.as_ptr() as i32,
+            root.len() as i32,
+            LIST_BUF.as_mut_ptr() as i32,
+            LIST_BUF.len() as i32,
+        )
+    };
+    if n <= 0 {
+        return false;
+    }
+    let bytes = unsafe { &LIST_BUF[..(n as usize).min(LIST_BUF.len())] };
+    let text = String::from_utf8_lossy(bytes);
+    text.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.ends_with(".sln")
+            || lower.ends_with(".slnx")
+            || lower.ends_with(".csproj")
+            || lower.ends_with(".fsproj")
+            || lower.ends_with(".vbproj")
+    })
+}
+
+/// MSBuild output directories and managed assemblies.
+#[basalt_plugin]
+fn shadow_excludes(root: &str) -> Vec<u8> {
+    if root_has_dotnet_project(root) {
+        br#"["**/bin/**","**/obj/**","**/TestResults/**","**/*.dll","**/*.pdb"]"#.to_vec()
+    } else {
+        b"[]".to_vec()
+    }
+}
 
 #[derive(Clone)]
 struct ProjectInfo {
