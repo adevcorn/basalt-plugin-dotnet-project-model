@@ -7,8 +7,8 @@ use basalt_plugin_sdk::prelude::*;
 
 basalt_plugin_meta! {
     name:         "dotnet-project-model",
-    version:      "0.1.1",
-    hook_flags:   CAP_PROJECT_MODEL | CAP_REVIEW_ACTIONS | CAP_BUILD_SYSTEM | CAP_TEST_RUNNER | CAP_SHADOW_EXCLUDES,
+    version:      "0.1.2",
+    hook_flags:   CAP_PROJECT_MODEL | CAP_REVIEW_ACTIONS | CAP_BUILD_SYSTEM | CAP_TEST_RUNNER | CAP_SHADOW_EXCLUDES | CAP_SHADOW_SYMLINKS,
     provides:     "project-model:dotnet",
     requires:     "",
     file_globs:   "",
@@ -71,6 +71,18 @@ fn root_has_dotnet_project(root: &str) -> bool {
 fn shadow_excludes(root: &str) -> Vec<u8> {
     if root_has_dotnet_project(root) {
         br#"["**/bin/**","**/obj/**","**/TestResults/**","**/*.dll","**/*.pdb"]"#.to_vec()
+    } else {
+        b"[]".to_vec()
+    }
+}
+
+/// Restored packages folders. Modern NuGet restores into the global cache, but
+/// legacy `packages.config` and workspace-local feeds keep a copy under the
+/// root; link those instead of copying them into every shadow.
+#[basalt_plugin]
+fn shadow_symlinks(root: &str) -> Vec<u8> {
+    if root_has_dotnet_project(root) {
+        br#"["packages","**/.nuget/packages"]"#.to_vec()
     } else {
         b"[]".to_vec()
     }
